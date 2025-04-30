@@ -2,17 +2,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
 import numpy as np
 from typing import List, Tuple, Dict
-import gymnasium as gym
-from dataclasses import dataclass
-from sklearn.metrics.pairwise import cosine_similarity
 import torch.nn.functional as F
-
-@dataclass
-class Trajectory:
-    states: List[str]  # Sequence of states (prompts + responses)
-    actions: List[str]  # Sequence of generated responses
-    rewards: List[float]  # Sequence of rewards
-    log_probs: List[torch.Tensor]  # Sequence of log probabilities
 
 class TopicEmbeddingModel:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
@@ -67,17 +57,14 @@ class TopicEmbeddingModel:
         """Compute and store embeddings for all topic descriptions."""
         topic_embeddings = {}
         for topic, descriptions in self.target_topics.items():
-            # Get embeddings for all descriptions
             embeddings = []
             for desc in descriptions:
                 inputs = self.tokenizer(desc, return_tensors="pt", padding=True, truncation=True).to(self.device)
                 with torch.no_grad():
                     outputs = self.model(**inputs)
-                    # Use mean pooling to get sentence embedding
                     embedding = self._mean_pooling(outputs, inputs['attention_mask'])
                     embeddings.append(embedding)
             
-            # Average embeddings for the topic
             topic_embedding = torch.mean(torch.stack(embeddings), dim=0)
             topic_embeddings[topic] = topic_embedding
             
@@ -99,14 +86,10 @@ class TopicEmbeddingModel:
     def calculate_topic_similarity(self, text: str) -> float:
         """Calculate similarity between text and target topics."""
         text_embedding = self.get_embedding(text)
-        
-        # Calculate similarity with each topic
         similarities = []
         for topic_embedding in self.topic_embeddings.values():
             similarity = F.cosine_similarity(text_embedding, topic_embedding, dim=1)
             similarities.append(similarity.item())
-        
-        # Return maximum similarity (how close to any target topic)
         return max(similarities)
 
 class RewardModel:
@@ -115,22 +98,15 @@ class RewardModel:
         
     def calculate_reward(self, prompt: str, response: str) -> float:
         """Calculate reward based on topic similarity."""
-        # Calculate topic similarity for the response
         topic_similarity = self.topic_model.calculate_topic_similarity(response)
-        
-        # Calculate coherence with prompt
         prompt_embedding = self.topic_model.get_embedding(prompt)
         response_embedding = self.topic_model.get_embedding(response)
         coherence = F.cosine_similarity(prompt_embedding, response_embedding, dim=1).item()
-        
-        # Combine topic similarity and coherence
-        # Topic similarity is more important (0.7 weight) than coherence (0.3 weight)
         reward = 0.7 * topic_similarity + 0.3 * coherence
-        
         return reward
 
 class QwenRLAgent:
-    def __init__(self, model_name: str = "Qwen/Qwen-1_8B", num_trajectories: int = 4):
+    def __init__(self, model_name: str = "Qwen/Qwen-1_8B"):
         print(f"Initializing QwenRLAgent with model: {model_name}")
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         print(f"Using device: {self.device}")
@@ -146,7 +122,6 @@ class QwenRLAgent:
         ).to(self.device)
         print("Model loaded successfully")
         
-        self.num_trajectories = num_trajectories
         self.reward_model = RewardModel()
         
         # Freeze the model parameters
@@ -162,37 +137,21 @@ class QwenRLAgent:
 
     def save_model(self, path: str):
         """Save the reinforced model and policy head."""
-        # Save the policy head
         torch.save(self.policy_head.state_dict(), f"{path}/policy_head.pt")
-        
-        # Save the tokenizer
         self.tokenizer.save_pretrained(path)
-        
-        # Save the model config
         self.model.config.save_pretrained(path)
-        
         print(f"Model saved to {path}")
 
     def generate_response(self, prompt: str) -> str:
-        print(f"\nGenerating response for prompt: {prompt[:50]}...")
         inputs = self.tokenizer(prompt, return_tensors="pt")
-        # Move inputs to the correct device
         for key in inputs:
             inputs[key] = inputs[key].to(self.device)
-        print(f"Input tensor device: {inputs['input_ids'].device}")
         
-        # Generate response
-        print("Generating text...")
         try:
             with torch.no_grad():
-                print("Starting generation with parameters:")
-                print(f"- max_new_tokens: 128")
-                print(f"- temperature: 0.7")
-                print(f"- top_p: 0.9")
-                
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=128,  # Reduced from 512
+                    max_new_tokens=128,
                     do_sample=True,
                     temperature=0.7,
                     top_p=0.9,
@@ -202,16 +161,11 @@ class QwenRLAgent:
                     output_scores=True,
                     return_dict_in_generate=True
                 )
-                print("Generation completed successfully")
-                
                 response = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
-                print(f"Generated response length: {len(response)} characters")
-                print(f"Generated response: {response[:100]}...")
-                return response[len(prompt):]  # Return only the generated part
+                return response[len(prompt):]
         except Exception as e:
             print(f"Error during generation: {str(e)}")
             print("Falling back to CPU...")
-            # Try on CPU as fallback
             self.model = self.model.to("cpu")
             inputs = {k: v.to("cpu") for k, v in inputs.items()}
             with torch.no_grad():
@@ -227,62 +181,31 @@ class QwenRLAgent:
                 response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
                 return response[len(prompt):]
 
-    def generate_trajectories(self, prompt: str) -> List[Tuple[str, float]]:
-        print(f"\nGenerating {self.num_trajectories} trajectories...")
-        trajectories = []
-        for i in range(self.num_trajectories):
-            print(f"\nTrajectory {i+1}/{self.num_trajectories}")
-            response = self.generate_response(prompt)
-            print("Calculating reward...")
-            reward = self.reward_model.calculate_reward(prompt, response)
-            print(f"Reward: {reward:.4f}")
-            trajectories.append((response, reward))
-        return trajectories
-
     def train_step(self, prompt: str, target_response: str) -> float:
-        print("\nStarting training step...")
-        # Generate trajectories
-        trajectories = self.generate_trajectories(prompt)
+        """Simple policy gradient training step."""
+        # Generate a single response
+        response = self.generate_response(prompt)
         
-        # Calculate PPO loss
-        print("\nCalculating PPO loss...")
-        loss = 0.0
-        for i, (response, reward) in enumerate(trajectories):
-            print(f"\nProcessing trajectory {i+1}")
-            # Tokenize the response
-            response_tokens = self.tokenizer(response, return_tensors="pt").to(self.device)
-            print(f"Response tokens device: {response_tokens['input_ids'].device}")
-            
-            # Get model outputs
-            print("Getting model outputs...")
-            with torch.no_grad():
-                outputs = self.model(**response_tokens, output_hidden_states=True)
-                hidden_states = outputs.hidden_states[-1]  # Get last layer hidden states
-                print(f"Hidden states shape: {hidden_states.shape}")
-            
-            # Get policy logits
-            print("Calculating policy logits...")
-            policy_logits = self.policy_head(hidden_states)
-            print(f"Policy logits shape: {policy_logits.shape}")
-            
-            # Calculate PPO loss
-            print("Calculating loss...")
-            loss += -reward * torch.log_softmax(policy_logits, dim=-1).mean()
-            print(f"Current loss: {loss.item():.4f}")
+        # Calculate reward
+        reward = self.reward_model.calculate_reward(prompt, response)
         
-        # Average the loss
-        loss = loss / self.num_trajectories
-        print(f"\nFinal loss: {loss.item():.4f}")
+        # Get model outputs for policy gradient
+        response_tokens = self.tokenizer(response, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**response_tokens, output_hidden_states=True)
+            hidden_states = outputs.hidden_states[-1]  # Get last layer hidden states
+            
+        # Calculate policy gradient loss
+        policy_logits = self.policy_head(hidden_states)
         
-        # Backward pass
-        print("Performing backward pass...")
-        loss.backward()
+        # Calculate policy gradient loss (using log probabilities)
+        loss = -reward * torch.log_softmax(policy_logits, dim=-1).mean()
         
         # Update policy head
-        print("Updating policy head...")
         optimizer = torch.optim.Adam(self.policy_head.parameters(), lr=1e-4)
-        optimizer.step()
         optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         
         return loss.item()
 
@@ -290,52 +213,68 @@ class TextEnvironment:
     def __init__(self):
         self.prompts = [
             "Explain the concept of reinforcement learning.",
-            "What are the ethical considerations in AI development?",
-            "How can we ensure AI systems are aligned with human values?",
-            "Describe the difference between supervised and unsupervised learning."
+            "What are the ethical considerations in AI?",
+            "Describe the process of machine learning model training."
         ]
         self.current_prompt_idx = 0
-        
+    
     def reset(self) -> str:
-        """Get a new prompt."""
+        """Reset the environment and return the first prompt."""
+        self.current_prompt_idx = 0
+        return self.prompts[self.current_prompt_idx]
+    
+    def step(self, response: str) -> Tuple[str, float, bool]:
+        """Take a step in the environment."""
         prompt = self.prompts[self.current_prompt_idx]
-        self.current_prompt_idx = (self.current_prompt_idx + 1) % len(self.prompts)
-        return prompt
+        reward = self.calculate_reward(prompt, response)
+        
+        self.current_prompt_idx += 1
+        done = self.current_prompt_idx >= len(self.prompts)
+        
+        if not done:
+            next_prompt = self.prompts[self.current_prompt_idx]
+        else:
+            next_prompt = None
+            
+        return next_prompt, reward, done
+    
+    def calculate_reward(self, prompt: str, response: str) -> float:
+        """Calculate reward for the response."""
+        reward_model = RewardModel()
+        return reward_model.calculate_reward(prompt, response)
 
 def train():
-    print("Starting training...")
-    num_trajectories = 4
-    max_steps = 3
-    agent = QwenRLAgent(num_trajectories=num_trajectories)
+    """Train the RL agent."""
+    agent = QwenRLAgent()
     env = TextEnvironment()
     
-    num_episodes = 100
-    best_reward = float('-inf')
-    
+    num_episodes = 10
     for episode in range(num_episodes):
-        print(f"\n{'='*50}")
-        print(f"Episode {episode + 1}/{num_episodes}")
-        print(f"{'='*50}")
-        
+        print(f"\nEpisode {episode + 1}/{num_episodes}")
         prompt = env.reset()
-        print(f"Initial Prompt: {prompt}")
+        total_reward = 0
         
-        # Collect trajectories
-        trajectories = agent.generate_trajectories(prompt)
+        while True:
+            # Generate response
+            response = agent.generate_response(prompt)
+            
+            # Get next state and reward
+            next_prompt, reward, done = env.step(response)
+            total_reward += reward
+            
+            # Train on the current step
+            loss = agent.train_step(prompt, response)
+            print(f"Step reward: {reward:.4f}, Loss: {loss:.4f}")
+            
+            if done:
+                break
+                
+            prompt = next_prompt
         
-        # Calculate average reward for this episode
-        episode_reward = np.mean([reward for response, reward in trajectories])
-        print(f"\nEpisode Reward: {episode_reward:.4f}")
-        
-        # Update policy
-        loss = agent.train_step(prompt, trajectories[-1][0])
-        print(f"Policy Loss: {loss:.4f}")
-        
-        # Save model if it's the best so far
-        if episode_reward > best_reward:
-            best_reward = episode_reward
-            agent.save_model("reinforced_qwen")
-            print(f"\nNew best model saved with reward: {best_reward:.4f}")
+        print(f"Episode {episode + 1} completed. Total reward: {total_reward:.4f}")
+    
+    # Save the trained model
+    agent.save_model("trained_model")
 
 if __name__ == "__main__":
     train() 

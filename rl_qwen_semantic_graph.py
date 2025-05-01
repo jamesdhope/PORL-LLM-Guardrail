@@ -399,7 +399,7 @@ def train():
         # Save model if it's the best so far
         if episode_reward > best_reward:
             best_reward = episode_reward
-            agent.save_model()
+            agent.save_model("/")
             print(f"\nNew best model saved with reward: {best_reward:.4f}")
 
 if __name__ == "__main__":

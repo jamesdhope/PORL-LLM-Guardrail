@@ -86,11 +86,23 @@ class RewardModel:
     def __init__(self):
         self.topic_model = TopicEmbeddingModel()
         self.node_sequence = []  # Track the entire sequence of nodes
+        self.exploration_factor = 0.8  # Probability of exploring a different node
         
     def calculate_reward(self, prompt: str, response: str) -> float:
         """Calculate reward based on graph traversal."""
         # Detect current node from response
         current_node, node_similarity = self.topic_model.detect_node(response)
+        
+        # With some probability, force exploration to a different node
+        if len(self.node_sequence) > 0 and torch.rand(1).item() < self.exploration_factor:
+            # Get all possible nodes
+            all_nodes = list(self.topic_model.nodes.keys())
+            # Remove current node and previous nodes from options
+            available_nodes = [node for node in all_nodes if node != current_node and node not in self.node_sequence]
+            if available_nodes:
+                # Randomly select a new node to explore
+                current_node = available_nodes[torch.randint(0, len(available_nodes), (1,)).item()]
+                print(f"\nForcing exploration to node: {current_node}")
         
         if not self.node_sequence:
             # First response, only reward for being in a valid node
@@ -119,10 +131,13 @@ class RewardModel:
         self.node_sequence = []
 
 class QwenRLAgent:
-    def __init__(self, model_name: str = "Qwen/Qwen-1_8B", num_trajectories: int = 4):
+    def __init__(self, model_name: str = "Qwen/Qwen-1_8B", num_trajectories: int = 4, max_tokens: int = 200):
         print(f"Initializing QwenRLAgent with model: {model_name}")
-        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        self.device = "cpu"  # Force CPU usage
         print(f"Using device: {self.device}")
+        
+        self.max_tokens = max_tokens
+        print(f"Maximum tokens per response: {max_tokens}")
         
         print("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -130,8 +145,10 @@ class QwenRLAgent:
         print("Loading model...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map=self.device,
-            trust_remote_code=True
+            device_map="cpu",  # Force CPU usage
+            trust_remote_code=True,
+            torch_dtype=torch.float32,  # Use float32 instead of float16
+            low_cpu_mem_usage=True  # Optimize memory usage
         ).to(self.device)
         print("Model loaded successfully")
         
@@ -170,33 +187,64 @@ class QwenRLAgent:
             inputs[key] = inputs[key].to(self.device)
         print(f"Input tensor device: {inputs['input_ids'].device}")
         
+        # Get current node from previous response if it exists
+        current_node = None
+        if self.reward_model.node_sequence:
+            current_node = self.reward_model.node_sequence[-1]
+        
+        # Adjust generation parameters based on node transitions
+        if current_node:
+            # Get valid transitions from current node
+            valid_transitions = [target for source, target in self.reward_model.topic_model.valid_transitions 
+                               if source == current_node]
+            
+            if valid_transitions:
+                # Increase temperature and top_p to encourage exploration
+                temperature = 0.9 + torch.rand(1).item() * 0.3  # Higher range: 0.9-1.2
+                top_p = 0.95 + torch.rand(1).item() * 0.05  # Higher range: 0.95-1.0
+                print(f"Encouraging transition from {current_node} to possible nodes: {valid_transitions}")
+            else:
+                # Normal generation parameters
+                temperature = 0.7 + torch.rand(1).item() * 0.3  # 0.7-1.0
+                top_p = 0.9 + torch.rand(1).item() * 0.1  # 0.9-1.0
+        else:
+            # First response, use normal parameters
+            temperature = 0.7 + torch.rand(1).item() * 0.3
+            top_p = 0.9 + torch.rand(1).item() * 0.1
+        
         # Generate response
         print("Generating text...")
         try:
             with torch.no_grad():
                 print("Starting generation with parameters:")
-                print(f"- max_new_tokens: 128")
-                print(f"- temperature: 0.7")
-                print(f"- top_p: 0.9")
+                print(f"- max_new_tokens: {self.max_tokens}")
+                print(f"- temperature: {temperature:.2f}")
+                print(f"- top_p: {top_p:.2f}")
                 
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=128,  # Reduced from 512
+                    max_new_tokens=self.max_tokens,
                     do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
+                    temperature=temperature,
+                    top_p=top_p,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
                     num_return_sequences=1,
                     output_scores=True,
-                    return_dict_in_generate=True
+                    return_dict_in_generate=True,
+                    repetition_penalty=1.2
                 )
                 print("Generation completed successfully")
                 
-                response = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
+                # Get the generated text
+                full_response = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
+                
+                # Remove the prompt from the response
+                response = full_response[len(prompt):].strip()
+                
                 print(f"Generated response length: {len(response)} characters")
                 print(f"Generated response: {response[:100]}...")
-                return response[len(prompt):]  # Return only the generated part
+                return response
         except Exception as e:
             print(f"Error during generation: {str(e)}")
             print("Falling back to CPU...")
@@ -206,26 +254,54 @@ class QwenRLAgent:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=128,
+                    max_new_tokens=self.max_tokens,
                     do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
+                    temperature=temperature,
+                    top_p=top_p,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    repetition_penalty=1.2
                 )
-                response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                return response[len(prompt):]
+                full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                response = full_response[len(prompt):].strip()
+                return response
 
     def generate_trajectories(self, prompt: str) -> List[Tuple[str, float]]:
         print(f"\nGenerating {self.num_trajectories} trajectories...")
         trajectories = []
+        
+        # Reset the node sequence for a new trajectory
+        self.reward_model.reset_sequence()
+        
         for i in range(self.num_trajectories):
             print(f"\nTrajectory {i+1}/{self.num_trajectories}")
+            
+            # Generate response
             response = self.generate_response(prompt)
-            print("Calculating reward...")
+            
+            # Calculate reward and get node information
+            current_node, node_similarity = self.reward_model.topic_model.detect_node(response)
             reward = self.reward_model.calculate_reward(prompt, response)
+            
+            # Print node information
+            print("\nNode Information:")
+            print(f"Current Node: {current_node}")
+            print(f"Node Similarity: {node_similarity:.4f}")
+            if len(self.reward_model.node_sequence) > 1:
+                print(f"Previous Nodes: {self.reward_model.node_sequence[:-1]}")
+                print(f"Valid Transitions: {[self.reward_model.topic_model.check_transition(node, current_node) for node in self.reward_model.node_sequence[:-1]]}")
             print(f"Reward: {reward:.4f}")
+            
             trajectories.append((response, reward))
+            
+            # Print the full trajectory so far
+            print("\nCurrent Trajectory:")
+            for j, (resp, rew) in enumerate(trajectories):
+                node, _ = self.reward_model.topic_model.detect_node(resp)
+                print(f"Step {j+1}: Node={node}, Reward={rew:.4f}")
+                print(f"Response: {resp[:100]}...")
+                print("-" * 50)
+        
         return trajectories
 
     def train_step(self, prompt: str, target_response: str) -> float:
@@ -323,7 +399,7 @@ def train():
         # Save model if it's the best so far
         if episode_reward > best_reward:
             best_reward = episode_reward
-            agent.save_model("reinforced_qwen")
+            agent.save_model()
             print(f"\nNew best model saved with reward: {best_reward:.4f}")
 
 if __name__ == "__main__":
